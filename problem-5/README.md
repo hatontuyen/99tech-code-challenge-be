@@ -9,6 +9,8 @@ npm install
 npm run dev        # hot-reload dev server on http://localhost:3000
 ```
 
+Interactive API docs (Swagger UI): **http://localhost:3000/docs** — generated at boot from the same Zod schemas that validate requests, so the docs cannot drift from the behavior. Raw spec at `/openapi.json`.
+
 Production:
 
 ```bash
@@ -43,6 +45,8 @@ Base URL: `/api/v1/tokens`. All responses share one envelope: `{ data, paginatio
 | `PATCH` | `/api/v1/tokens/:id` | Partial update | `400`, `404`, `409` |
 | `DELETE` | `/api/v1/tokens/:id` | Delete (returns `204`) | `404` |
 | `GET` | `/healthz` | Liveness probe | — |
+| `GET` | `/docs` | Swagger UI (generated from the Zod schemas) | — |
+| `GET` | `/openapi.json` | Raw OpenAPI 3.0 document | — |
 
 ### List filters
 
@@ -101,4 +105,5 @@ curl -X DELETE localhost:3000/api/v1/tokens/<id>   # 204
 2. **Migrations** — numbered migration files (e.g. `node-pg-migrate`-style) once the schema evolves; swap SQLite for Postgres behind the same repository interface.
 3. **Observability** — structured JSON logs with request IDs, `/metrics` for Prometheus.
 4. **Idempotency keys** on `POST` for safe client retries.
-5. **OpenAPI spec** generated from the Zod schemas (`zod-to-openapi`) so docs can't drift from the code.
+
+*(An OpenAPI spec generated from the Zod schemas was originally on this list — it's now implemented: see `/docs`.)*

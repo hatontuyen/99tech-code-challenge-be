@@ -1,6 +1,8 @@
 import express from 'express';
+import swaggerUi from 'swagger-ui-express';
 import type { Db } from './db';
 import { errorHandler, notFoundHandler } from './middleware/errors';
+import { buildOpenApiDocument } from './openapi';
 import { TokenRepository } from './tokens/repository';
 import { tokensRouter } from './tokens/router';
 
@@ -35,6 +37,13 @@ export function createApp(db: Db): express.Express {
   // serving existing clients. Chosen over header versioning for visibility —
   // the version is in every log line, curl command, and bug report.
   app.use('/api/v1/tokens', tokensRouter(new TokenRepository(db)));
+
+  // Interactive docs generated from the runtime Zod schemas — can't drift.
+  const openApiDoc = buildOpenApiDocument();
+  app.get('/openapi.json', (_req, res) => {
+    res.json(openApiDoc);
+  });
+  app.use('/docs', swaggerUi.serve, swaggerUi.setup(openApiDoc));
 
   app.use(notFoundHandler);
   app.use(errorHandler);

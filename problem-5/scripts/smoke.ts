@@ -25,8 +25,11 @@ async function main() {
     return { status: res.status, headers: res.headers, json: text ? JSON.parse(text) : null };
   };
 
-  // Health
+  // Health + docs
   assert.equal((await call('GET', '/healthz')).status, 200);
+  const spec = await call('GET', '/openapi.json');
+  assert.equal(spec.status, 200);
+  assert.ok(spec.json.paths['/api/v1/tokens'], 'OpenAPI spec documents the tokens resource');
 
   // Create
   const created = await call('POST', '/api/v1/tokens', {
