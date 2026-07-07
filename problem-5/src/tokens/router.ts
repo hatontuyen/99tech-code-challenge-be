@@ -26,7 +26,7 @@ export function tokensRouter(repo: TokenRepository): Router {
     const input = parse(createTokenSchema, req.body);
     try {
       const token = repo.create(input);
-      res.status(201).location(`/api/tokens/${token.id}`).json({ data: token });
+      res.status(201).location(`/api/v1/tokens/${token.id}`).json({ data: token });
     } catch (err) {
       if (err instanceof DuplicateSymbolError) throw ApiError.conflict(err.message);
       throw err;

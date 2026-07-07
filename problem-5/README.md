@@ -33,21 +33,21 @@ No external database server needed — the DB file is created and migrated on fi
 
 ## API
 
-Base URL: `/api/tokens`. All responses share one envelope: `{ data, pagination? }` on success, `{ error: { code, message, details? } }` on failure.
+Base URL: `/api/v1/tokens`. All responses share one envelope: `{ data, pagination? }` on success, `{ error: { code, message, details? } }` on failure.
 
 | Method | Path | Purpose | Failure codes |
 |---|---|---|---|
-| `POST` | `/api/tokens` | Create a token (returns `201` + `Location` header) | `400` validation, `409` duplicate symbol |
-| `GET` | `/api/tokens` | List with filters + pagination | `400` bad query param |
-| `GET` | `/api/tokens/:id` | Get one | `404` |
-| `PATCH` | `/api/tokens/:id` | Partial update | `400`, `404`, `409` |
-| `DELETE` | `/api/tokens/:id` | Delete (returns `204`) | `404` |
+| `POST` | `/api/v1/tokens` | Create a token (returns `201` + `Location` header) | `400` validation, `409` duplicate symbol |
+| `GET` | `/api/v1/tokens` | List with filters + pagination | `400` bad query param |
+| `GET` | `/api/v1/tokens/:id` | Get one | `404` |
+| `PATCH` | `/api/v1/tokens/:id` | Partial update | `400`, `404`, `409` |
+| `DELETE` | `/api/v1/tokens/:id` | Delete (returns `204`) | `404` |
 | `GET` | `/healthz` | Liveness probe | — |
 
 ### List filters
 
 ```
-GET /api/tokens?chain=Ethereum&isActive=true&search=eth&sort=symbol&order=asc&page=1&limit=20
+GET /api/v1/tokens?chain=Ethereum&isActive=true&search=eth&sort=symbol&order=asc&page=1&limit=20
 ```
 
 - `chain` — exact match (`Ethereum`, `Arbitrum`, `Osmosis`, `Zilliqa`, `Neo`, `Polygon`)
@@ -60,24 +60,24 @@ GET /api/tokens?chain=Ethereum&isActive=true&search=eth&sort=symbol&order=asc&pa
 
 ```bash
 # Create
-curl -X POST localhost:3000/api/tokens \
+curl -X POST localhost:3000/api/v1/tokens \
   -H 'content-type: application/json' \
   -d '{"symbol":"SWTH","name":"Switcheo Token","chain":"Neo","decimals":8}'
 
 # Duplicate symbol (case-insensitive) → 409
-curl -X POST localhost:3000/api/tokens \
+curl -X POST localhost:3000/api/v1/tokens \
   -H 'content-type: application/json' \
   -d '{"symbol":"swth","name":"dup","chain":"Neo"}'
 
 # List active Neo tokens
-curl 'localhost:3000/api/tokens?chain=Neo&isActive=true'
+curl 'localhost:3000/api/v1/tokens?chain=Neo&isActive=true'
 
 # Update
-curl -X PATCH localhost:3000/api/tokens/<id> \
+curl -X PATCH localhost:3000/api/v1/tokens/<id> \
   -H 'content-type: application/json' -d '{"decimals":18}'
 
 # Delete
-curl -X DELETE localhost:3000/api/tokens/<id>   # 204
+curl -X DELETE localhost:3000/api/v1/tokens/<id>   # 204
 ```
 
 ## Assumptions (declared per the challenge instructions)

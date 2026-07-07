@@ -29,7 +29,7 @@ async function main() {
   assert.equal((await call('GET', '/healthz')).status, 200);
 
   // Create
-  const created = await call('POST', '/api/tokens', {
+  const created = await call('POST', '/api/v1/tokens', {
     symbol: 'SWTH',
     name: 'Switcheo Token',
     chain: 'Neo',
@@ -39,8 +39,8 @@ async function main() {
   assert.ok(created.headers.get('location')?.includes(created.json.data.id));
   const id = created.json.data.id as string;
 
-  await call('POST', '/api/tokens', { symbol: 'ETH', name: 'Ether', chain: 'Ethereum' });
-  await call('POST', '/api/tokens', {
+  await call('POST', '/api/v1/tokens', { symbol: 'ETH', name: 'Ether', chain: 'Ethereum' });
+  await call('POST', '/api/v1/tokens', {
     symbol: 'ZIL',
     name: 'Zilliqa',
     chain: 'Zilliqa',
@@ -49,19 +49,19 @@ async function main() {
 
   // Duplicate symbol -> 409 (case-insensitive)
   assert.equal(
-    (await call('POST', '/api/tokens', { symbol: 'swth', name: 'dup', chain: 'Neo' })).status,
+    (await call('POST', '/api/v1/tokens', { symbol: 'swth', name: 'dup', chain: 'Neo' })).status,
     409,
   );
 
   // Validation -> 400 with field details
-  const bad = await call('POST', '/api/tokens', { symbol: 'B AD', name: '', chain: 'Mars' });
+  const bad = await call('POST', '/api/v1/tokens', { symbol: 'B AD', name: '', chain: 'Mars' });
   assert.equal(bad.status, 400);
   assert.ok(Array.isArray(bad.json.error.details) && bad.json.error.details.length >= 3);
 
   // Unknown key rejected (strict schema)
   assert.equal(
     (
-      await call('POST', '/api/tokens', {
+      await call('POST', '/api/v1/tokens', {
         symbol: 'OK',
         name: 'ok',
         chain: 'Neo',
@@ -72,7 +72,7 @@ async function main() {
   );
 
   // Malformed JSON -> 400, not a crash
-  const rawRes = await fetch(`${base}/api/tokens`, {
+  const rawRes = await fetch(`${base}/api/v1/tokens`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: '{oops',
@@ -80,40 +80,40 @@ async function main() {
   assert.equal(rawRes.status, 400);
 
   // List + filters
-  const all = await call('GET', '/api/tokens');
+  const all = await call('GET', '/api/v1/tokens');
   assert.equal(all.json.pagination.total, 3);
-  const neo = await call('GET', '/api/tokens?chain=Neo');
+  const neo = await call('GET', '/api/v1/tokens?chain=Neo');
   assert.equal(neo.json.pagination.total, 1);
-  const inactive = await call('GET', '/api/tokens?isActive=false');
+  const inactive = await call('GET', '/api/v1/tokens?isActive=false');
   assert.equal(inactive.json.data[0].symbol, 'ZIL');
-  const search = await call('GET', '/api/tokens?search=switch');
+  const search = await call('GET', '/api/v1/tokens?search=switch');
   assert.equal(search.json.data[0].symbol, 'SWTH');
-  const sorted = await call('GET', '/api/tokens?sort=symbol&order=asc&limit=2&page=1');
+  const sorted = await call('GET', '/api/v1/tokens?sort=symbol&order=asc&limit=2&page=1');
   assert.deepEqual(
     sorted.json.data.map((t: { symbol: string }) => t.symbol),
     ['ETH', 'SWTH'],
   );
   assert.equal(sorted.json.pagination.totalPages, 2);
   // Bad query param -> 400, not a silent default
-  assert.equal((await call('GET', '/api/tokens?sort=drop_table')).status, 400);
+  assert.equal((await call('GET', '/api/v1/tokens?sort=drop_table')).status, 400);
 
   // Get one / 404
-  assert.equal((await call('GET', `/api/tokens/${id}`)).json.data.symbol, 'SWTH');
-  assert.equal((await call('GET', '/api/tokens/nope')).status, 404);
+  assert.equal((await call('GET', `/api/v1/tokens/${id}`)).json.data.symbol, 'SWTH');
+  assert.equal((await call('GET', '/api/v1/tokens/nope')).status, 404);
 
   // Update
-  const updated = await call('PATCH', `/api/tokens/${id}`, { name: 'Switcheo', decimals: 18 });
+  const updated = await call('PATCH', `/api/v1/tokens/${id}`, { name: 'Switcheo', decimals: 18 });
   assert.equal(updated.json.data.name, 'Switcheo');
   assert.equal(updated.json.data.decimals, 18);
   assert.notEqual(updated.json.data.updatedAt, created.json.data.updatedAt);
   // Empty patch -> 400; renaming to an existing symbol -> 409
-  assert.equal((await call('PATCH', `/api/tokens/${id}`, {})).status, 400);
-  assert.equal((await call('PATCH', `/api/tokens/${id}`, { symbol: 'ETH' })).status, 409);
+  assert.equal((await call('PATCH', `/api/v1/tokens/${id}`, {})).status, 400);
+  assert.equal((await call('PATCH', `/api/v1/tokens/${id}`, { symbol: 'ETH' })).status, 409);
 
   // Delete
-  assert.equal((await call('DELETE', `/api/tokens/${id}`)).status, 204);
-  assert.equal((await call('GET', `/api/tokens/${id}`)).status, 404);
-  assert.equal((await call('DELETE', `/api/tokens/${id}`)).status, 404);
+  assert.equal((await call('DELETE', `/api/v1/tokens/${id}`)).status, 204);
+  assert.equal((await call('GET', `/api/v1/tokens/${id}`)).status, 404);
+  assert.equal((await call('DELETE', `/api/v1/tokens/${id}`)).status, 404);
 
   server.close();
   db.close();

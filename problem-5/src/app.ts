@@ -31,7 +31,10 @@ export function createApp(db: Db): express.Express {
     res.json({ status: 'ok', uptime: process.uptime() });
   });
 
-  app.use('/api/tokens', tokensRouter(new TokenRepository(db)));
+  // URL-path versioning: breaking changes ship as /api/v2 while v1 keeps
+  // serving existing clients. Chosen over header versioning for visibility —
+  // the version is in every log line, curl command, and bug report.
+  app.use('/api/v1/tokens', tokensRouter(new TokenRepository(db)));
 
   app.use(notFoundHandler);
   app.use(errorHandler);
