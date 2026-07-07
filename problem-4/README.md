@@ -15,6 +15,8 @@
 
 ## Assumptions (declared per the challenge instructions)
 
+The template in the task is not valid TypeScript (a `go` code fence with `func sum_to_n_a(n: number): number` — Go keywords with TS annotations). I took the *intent* — TypeScript functions with typed signatures — rather than reproducing the syntax literally.
+
 The spec doesn't define behavior for `n <= 0` while stating the input is *any* integer. I chose the least surprising extension — summation *from the origin toward n* (so `sum_to_n(-5) === -15`) — and made all three implementations consistent with it. In a real ticket I'd confirm this with the spec author first.
 
 ## Design decisions
