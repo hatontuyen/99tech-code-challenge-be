@@ -274,7 +274,7 @@ Client          Action Svc        Score Svc          Redis        Postgres      
 3. **Season/period support will be asked for.** Keying the ZSET as `leaderboard:{period}` (e.g. `2026-W28`) from day one costs nothing and makes "weekly leaderboard" a config change instead of a migration.
 4. **Display names on the board**: resolve via a small cached user-profile lookup in the WS gateway, not stored in the ZSET — avoids rename-propagation bugs.
 5. **Anomaly review queue, not auto-bans.** Velocity breaches should flag `score_events.flagged = true` for human review; auto-punishing false positives on a public leaderboard is a support nightmare.
-6. **Consider signing the WS snapshot `asOf`** so the frontend can ignore out-of-order frames after reconnects.
+6. **Frame ordering: a monotonic version number, not signatures and not timestamps.** `INCR scoreboard:version` exactly when the step-10 condition fires (so the version increments iff the visible board changed); every frame carries it, clients drop frames older than the last seen. It must be this and not the alternatives: a gateway-local sequence breaks the moment a client reconnects to a different gateway; `asOf` timestamps skew across hosts; signing solves integrity, which WSS already provides — the only real problem here is ordering. Bonus: the heartbeat backstop's push-if-changed becomes a one-integer comparison instead of a frame diff.
 7. **Open question for the action team:** can one user legitimately run several actions concurrently? If yes, keep the 10-minute token TTL; if strictly sequential, drop it to ~2× median action duration to shrink the replay window further.
 
 ## 10. Definition of done (for the implementing team)
