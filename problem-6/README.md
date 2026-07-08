@@ -50,7 +50,7 @@ flowchart LR
     S -- validate JWT --> AU[Auth Service]
     S -- INCR + audit --> P[(PostgreSQL\nscore_events, users)]
     S -- ZINCRBY / ZREVRANGE --> R[(Redis\nleaderboard ZSET\n+ used-token set)]
-    S -- publish top-10 diff --> PS[Redis Pub/Sub]
+    S -- publish top-10 update --> PS[Redis Pub/Sub]
     PS --> W1[WS Gateway 1]
     PS --> W2[WS Gateway N]
     W1 -- push update --> C2[Subscribed clients]
@@ -94,7 +94,7 @@ Redis keys:
 | Key | Type | Purpose |
 |---|---|---|
 | `leaderboard:global` | ZSET (member = user_id, score = total) | `ZINCRBY` on accept; `ZREVRANGE 0 9 WITHSCORES` for top 10 |
-| `action_token:used:{jti}` | STRING with TTL = token TTL | single-use enforcement (`SET NX`) |
+| `action_token:used:{jti}` | STRING, TTL = remaining token lifetime + 1 min margin | fast replay **pre-filter** — the authoritative barrier is the DB `UNIQUE` (§5.2 step 7) |
 | `velocity:{user_id}:{action_type}:{hour}` | INT with 1h TTL | rate/velocity counting |
 
 ## 5. API specification
@@ -125,7 +125,7 @@ The token is a signed JWS containing `{ jti, sub: userId, act: actionType, iat, 
     "userId": "u-123",
     "delta": 10,
     "newScore": 1250,
-    "rank": 7          // null if outside top 100
+    "rank": 7          // exact rank via ZREVRANK + 1, O(log n) for any user
   }
 }
 ```
@@ -138,13 +138,14 @@ Validation pipeline (order matters — cheapest and most-likely-to-fail first):
 | 2 | Rate limit: ≤ 10 redemptions/min/user (burst 20) | `429 RATE_LIMITED` + `Retry-After` |
 | 3 | Action token signature + `exp` | `401 INVALID_ACTION_TOKEN` |
 | 4 | `token.sub === jwt.sub` (no redeeming someone else's token) | `403 TOKEN_USER_MISMATCH` |
-| 5 | Single-use: `SET action_token:used:{jti} NX` succeeds | `409 TOKEN_ALREADY_USED` |
-| 6 | Velocity: per-user per-action-type hourly cap | `429 VELOCITY_EXCEEDED` (flag for review) |
-| 7 | Insert `score_events` row (UNIQUE `action_token_id` = 2nd replay barrier) | `409` |
-| 8 | `ZINCRBY leaderboard:global delta user_id` | — |
-| 9 | If top-10 changed → publish to Pub/Sub | — |
+| 5 | Velocity: per-user per-action-type hourly cap — checked **before** the token is consumed, so an over-cap user's token is not burned | `429 VELOCITY_EXCEEDED` (flag for review) |
+| 6 | Fast replay pre-filter: `EXISTS action_token:used:{jti}` | `409 TOKEN_ALREADY_USED` |
+| 7 | Insert `score_events` row — the `UNIQUE(action_token_id)` constraint is the **authoritative** single-use barrier | `409` → idempotent: look up the recorded event by `jti` and return its original response |
+| 8 | Mark `action_token:used:{jti}` (TTL = remaining token lifetime + 1 min margin) | best-effort |
+| 9 | `ZINCRBY leaderboard:global delta user_id` | — |
+| 10 | If top-10 changed → publish to Pub/Sub | — |
 
-Steps 7–8: write Postgres first, then Redis. A crash between the two leaves Redis stale by one event, which the reconciliation job (§8) repairs; the ledger is never wrong.
+**Why the ledger writes before the Redis marker (ordering is load-bearing):** the durable store must be the authority on "was this token used", and the cache only a fast path. If the order were reversed (mark in Redis, then insert), a crash between the two would burn the token with no ledger record — the user's points would be unrecoverable and a retry would see `409`. With DB-first, every crash window is safe: crash after step 7 → the ledger has the event, a client retry hits the `UNIQUE` violation and receives the original response (natural idempotency); Redis staleness (marker or ZSET) is repaired by the reconciliation job (§8). The ledger is never wrong.
 
 ### 5.3 `GET /api/v1/scoreboard` *(public, no auth)*
 
@@ -191,17 +192,21 @@ sequenceDiagram
     G-->>U: action payload + actionToken
     Note over U: user completes the action
     U->>S: POST /api/v1/scores/events { actionToken } + JWT
-    S->>S: verify JWT, rate limit, verify JWS, sub match
-    S->>R: SET action_token:used:{jti} NX
-    alt already used
+    S->>S: verify JWT, rate limit, verify JWS, sub match, velocity cap
+    S->>R: EXISTS action_token:used:{jti} (fast pre-filter)
+    alt marker present
         S-->>U: 409 TOKEN_ALREADY_USED
-    else first use
-        S->>P: INSERT score_events (audit, UNIQUE jti)
-        S->>R: ZINCRBY leaderboard:global delta user
-        S->>R: PUBLISH scoreboard.updated (if top-10 changed)
-        S-->>U: 200 { newScore, rank }
-        R-->>W: pub/sub message
-        W-->>U: WS push: fresh top-10 snapshot
+    else not seen
+        S->>P: INSERT score_events (UNIQUE jti = authoritative barrier)
+        alt UNIQUE violation (replay past the pre-filter)
+            S-->>U: idempotent response from the recorded event
+        else inserted
+            S->>R: SET action_token:used:{jti} (marker) + ZINCRBY
+            S->>R: PUBLISH scoreboard.updated (if top-10 changed)
+            S-->>U: 200 { newScore, rank }
+            R-->>W: pub/sub message
+            W-->>U: WS push: fresh top-10 snapshot
+        end
     end
 ```
 
@@ -214,9 +219,9 @@ Client          Action Svc        Score Svc          Redis        Postgres      
   |<--action+token-|<-----JWS---------|                 |              |             |
   |  (user completes action)          |                 |              |             |
   |--redeem token + user JWT--------->|                 |              |             |
-  |                |                  |--SETNX used---->|              |             |
-  |                |                  |--INSERT event----------------->|             |
-  |                |                  |--ZINCRBY------->|              |             |
+  |                |                  |--EXISTS used?-->| (pre-filter) |             |
+  |                |                  |--INSERT event (UNIQUE jti)---->| (authority) |
+  |                |                  |--SET+ZINCRBY--->|              |             |
   |                |                  |--PUBLISH------->|---top-10 changed---------->|
   |<--200 {newScore, rank}------------|                 |              |             |
   |<=================== WS: new top-10 snapshot ================================...=|
@@ -227,7 +232,7 @@ Client          Action Svc        Score Svc          Redis        Postgres      
 | Attack | Defense |
 |---|---|
 | Forged/handcrafted API call with arbitrary points | No points field exists; deltas come from `action_score_rules` server-side |
-| Replaying a captured legitimate request | Single-use `jti` (Redis `SET NX`) **plus** DB `UNIQUE(action_token_id)` — two independent barriers |
+| Replaying a captured legitimate request | Single-use `jti`: DB `UNIQUE(action_token_id)` is the authoritative barrier, with a Redis marker as fast pre-filter — two independent layers, and the durable one is in charge |
 | Redeeming a token issued to another user | Step 4: token `sub` must equal JWT `sub` |
 | Minting tokens client-side | Tokens are signed with a key that never leaves the server (issuing endpoint is internal-only, mTLS) |
 | Completing actions inhumanly fast (botting) | Per-user rate limit + per-action-type velocity caps; breaches are flagged, not just rejected |
@@ -245,7 +250,7 @@ Client          Action Svc        Score Svc          Redis        Postgres      
 
 *(requested by the task — recommendations to the team beyond the stated requirements)*
 
-1. **Idempotency for the client too.** Allow an `Idempotency-Key` header on redemption so a mobile client that times out can safely retry and receive the original response instead of a `409`. Cheap to add now, painful to retrofit.
+1. **Idempotency is built in — document it as a client contract.** The `jti` acts as the idempotency key: a retry after a network timeout hits the `UNIQUE` constraint (§5.2 step 7) and receives the original response, not an error. Spell this out in the client-facing API docs so mobile teams retry with confidence instead of inventing their own dedupe.
 2. **Don't build diff-based WS frames.** Teams instinctively optimize this; at 10 rows the snapshot *is* the optimization. Revisit only if the board grows to hundreds of visible rows.
 3. **Season/period support will be asked for.** Keying the ZSET as `leaderboard:{period}` (e.g. `2026-W28`) from day one costs nothing and makes "weekly leaderboard" a config change instead of a migration.
 4. **Display names on the board**: resolve via a small cached user-profile lookup in the WS gateway, not stored in the ZSET — avoids rename-propagation bugs.
