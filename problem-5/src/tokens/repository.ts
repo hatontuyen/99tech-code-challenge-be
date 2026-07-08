@@ -1,6 +1,13 @@
+import Database from 'better-sqlite3';
 import { randomUUID } from 'node:crypto';
 import type { Db } from '../db';
 import type { CreateTokenInput, ListQuery, Token, UpdateTokenInput } from './schema';
+
+// Detect by error code, not message text — the code is better-sqlite3's stable
+// contract. `tokens` has a single UNIQUE constraint (symbol), so no further
+// disambiguation is needed; add a message check if a second one ever appears.
+const isUniqueViolation = (err: unknown): boolean =>
+  err instanceof Database.SqliteError && err.code === 'SQLITE_CONSTRAINT_UNIQUE';
 
 interface TokenRow {
   id: string;
@@ -56,7 +63,7 @@ export class TokenRepository {
         )
         .run(row);
     } catch (err) {
-      if (err instanceof Error && err.message.includes('UNIQUE constraint failed')) {
+      if (isUniqueViolation(err)) {
         throw new DuplicateSymbolError(`symbol '${input.symbol}' already exists`);
       }
       throw err;
@@ -131,7 +138,7 @@ export class TokenRepository {
         )
         .run(next);
     } catch (err) {
-      if (err instanceof Error && err.message.includes('UNIQUE constraint failed')) {
+      if (isUniqueViolation(err)) {
         throw new DuplicateSymbolError(`symbol '${input.symbol}' already exists`);
       }
       throw err;

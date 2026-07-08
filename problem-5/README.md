@@ -9,7 +9,7 @@ npm install
 npm run dev        # hot-reload dev server on http://localhost:3000
 ```
 
-Interactive API docs (Swagger UI): **http://localhost:3000/docs** — generated at boot from the same Zod schemas that validate requests, so the docs cannot drift from the behavior. Raw spec at `/openapi.json`.
+Interactive API docs (Swagger UI): **http://localhost:3000/docs** — generated at boot from the same Zod schemas the app runs on: request schemas validate at runtime, and the response `Token` type is inferred from the documented schema, so neither side of the docs can drift from the behavior. Raw spec at `/openapi.json`.
 
 Production:
 
@@ -56,7 +56,7 @@ GET /api/v1/tokens?chain=Ethereum&isActive=true&search=eth&sort=symbol&order=asc
 
 - `chain` — exact match (`Ethereum`, `Arbitrum`, `Osmosis`, `Zilliqa`, `Neo`, `Polygon`)
 - `isActive` — `true` / `false`
-- `search` — case-insensitive substring on symbol *or* name (LIKE wildcards in the input are escaped, so searching `50%` means the literal string)
+- `search` — case-insensitive substring on symbol *or* name (LIKE wildcards in the input are escaped, so searching `50%` means the literal string; case-folding is ASCII-only — SQLite `LIKE` semantics — so non-ASCII characters match case-sensitively)
 - `sort` (`createdAt` | `symbol` | `name`) + `order` (`asc` | `desc`)
 - `page` / `limit` (max 100) — response includes `pagination: { page, limit, total, totalPages }`
 

@@ -50,13 +50,17 @@ export type CreateTokenInput = z.infer<typeof createTokenSchema>;
 export type UpdateTokenInput = z.infer<typeof updateTokenSchema>;
 export type ListQuery = z.infer<typeof listQuerySchema>;
 
-export interface Token {
-  id: string;
-  symbol: string;
-  name: string;
-  chain: (typeof CHAINS)[number];
-  decimals: number;
-  isActive: boolean;
-  createdAt: string;
-  updatedAt: string;
-}
+// Single source of truth for the response shape: the repository's return type
+// AND the OpenAPI Token schema both derive from this, so they cannot drift.
+export const tokenSchema = z.object({
+  id: z.string().uuid(),
+  symbol: z.string(),
+  name: z.string(),
+  chain: z.enum(CHAINS),
+  decimals: z.number().int(),
+  isActive: z.boolean(),
+  createdAt: z.string().datetime(),
+  updatedAt: z.string().datetime(),
+});
+
+export type Token = z.infer<typeof tokenSchema>;

@@ -4,30 +4,24 @@ import {
   extendZodWithOpenApi,
 } from '@asteasolutions/zod-to-openapi';
 import { z } from 'zod';
-import { CHAINS, createTokenSchema, listQuerySchema, updateTokenSchema } from './tokens/schema';
+import {
+  createTokenSchema,
+  listQuerySchema,
+  tokenSchema,
+  updateTokenSchema,
+} from './tokens/schema';
 
 extendZodWithOpenApi(z);
 
 /**
- * The OpenAPI document is GENERATED from the same Zod schemas that validate
- * requests at runtime — the docs cannot drift from the behavior. Response
- * shapes are derived from the request schemas plus server-assigned fields.
+ * The OpenAPI document is GENERATED from the same Zod schemas the app runs on:
+ * request schemas validate at runtime, and `tokenSchema` is the source of the
+ * repository's `Token` type — neither side of the docs can drift.
  */
 
 const registry = new OpenAPIRegistry();
 
-const tokenResponseSchema = z
-  .object({
-    id: z.string().uuid(),
-    symbol: z.string(),
-    name: z.string(),
-    chain: z.enum(CHAINS),
-    decimals: z.number().int(),
-    isActive: z.boolean(),
-    createdAt: z.string().datetime(),
-    updatedAt: z.string().datetime(),
-  })
-  .openapi('Token');
+const tokenResponseSchema = tokenSchema.openapi('Token');
 
 const errorSchema = z
   .object({

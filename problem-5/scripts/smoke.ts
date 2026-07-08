@@ -116,7 +116,10 @@ async function main() {
   const updated = await call('PATCH', `/api/v1/tokens/${id}`, { name: 'Switcheo', decimals: 18 });
   assert.equal(updated.json.data.name, 'Switcheo');
   assert.equal(updated.json.data.decimals, 18);
-  assert.notEqual(updated.json.data.updatedAt, created.json.data.updatedAt);
+  // >= not !== : create and patch can land in the same millisecond, so
+  // inequality would be flaky; monotonicity plus the changed fields above
+  // is what the API actually guarantees.
+  assert.ok(updated.json.data.updatedAt >= created.json.data.updatedAt);
   // Empty patch -> 400; renaming to an existing symbol -> 409
   assert.equal((await call('PATCH', `/api/v1/tokens/${id}`, {})).status, 400);
   assert.equal((await call('PATCH', `/api/v1/tokens/${id}`, { symbol: 'ETH' })).status, 409);
