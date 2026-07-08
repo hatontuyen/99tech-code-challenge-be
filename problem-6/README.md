@@ -70,12 +70,23 @@ flowchart LR
 ## 4. Data model
 
 ```sql
+-- Materialized per-user total, owned by this module. Updated in the same
+-- transaction as the ledger insert; its row lock serializes concurrent
+-- redemptions for one user and yields score_after atomically.
+CREATE TABLE user_scores (
+  user_id UUID PRIMARY KEY REFERENCES users(id),
+  score   BIGINT NOT NULL DEFAULT 0
+);
+
 -- Append-only ledger. Never UPDATE; corrections are compensating events.
 CREATE TABLE score_events (
   id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   user_id       UUID        NOT NULL REFERENCES users(id),
   action_type   TEXT        NOT NULL,          -- e.g. 'daily_quest'
   delta         INTEGER     NOT NULL CHECK (delta > 0),
+  score_after   BIGINT      NOT NULL,          -- running total after this event: makes the
+                                               -- idempotent replay reconstructible (§5.2) and
+                                               -- the ledger self-auditing (§8)
   action_token_id UUID      NOT NULL UNIQUE,   -- DB-level replay protection
   created_at    TIMESTAMPTZ NOT NULL DEFAULT now()
 );
@@ -124,8 +135,9 @@ The token is a signed JWS containing `{ jti, sub: userId, act: actionType, iat, 
   "data": {
     "userId": "u-123",
     "delta": 10,
-    "newScore": 1250,
-    "rank": 7          // exact rank via ZREVRANK + 1, O(log n) for any user
+    "newScore": 1250,  // score_after from the ledger — part of the idempotency contract
+    "rank": 7          // exact rank via ZREVRANK + 1, O(log n). Point-in-time view of a
+                       // moving board — explicitly NOT part of the idempotency contract
   }
 }
 ```
@@ -138,16 +150,16 @@ Validation pipeline (order matters — cheapest and most-likely-to-fail first):
 | 2 | Rate limit: ≤ 10 redemptions/min/user (burst 20) | `429 RATE_LIMITED` + `Retry-After` |
 | 3 | Action token signature + `exp` | `401 INVALID_ACTION_TOKEN` |
 | 4 | `token.sub === jwt.sub` (no redeeming someone else's token) | `403 TOKEN_USER_MISMATCH` |
-| 5 | Fast replay pre-filter: `EXISTS action_token:used:{jti}` — an already-redeemed token short-circuits here, **before** the velocity check, so retries never consume quota or hit the cap | marker hit → **same idempotent path as step 7**: look up the event by `jti`, return its original response; `409 TOKEN_ALREADY_USED` only if no ledger record exists (anomaly — impossible under DB-first ordering) |
+| 5 | Fast replay pre-filter: `EXISTS action_token:used:{jti}` — an already-redeemed token short-circuits here, **before** the velocity check, so retries never consume quota or hit the cap | marker hit → **same idempotent path as step 7**: look up the event by `jti`, return the recorded outcome; `409 TOKEN_ALREADY_USED` only if no ledger record exists (anomaly — impossible under DB-first ordering) |
 | 6 | Velocity: per-user per-action-type hourly cap — checked **before** the token is consumed, so an over-cap user's token is not burned. The counter increments only on accept (step 8), so rejected and replayed requests don't eat quota | `429 VELOCITY_EXCEEDED` (flag for review) |
-| 7 | Insert `score_events` row — the `UNIQUE(action_token_id)` constraint is the **authoritative** single-use barrier | `UNIQUE` violation → idempotent: look up the recorded event by `jti` and return its original response |
+| 7 | One transaction: `UPDATE user_scores SET score = score + delta RETURNING score` (row lock serializes concurrent redemptions per user, yields `score_after`) + insert `score_events` — the `UNIQUE(action_token_id)` constraint is the **authoritative** single-use barrier | `UNIQUE` violation → idempotent: look up the recorded event by `jti`, return the recorded outcome |
 | 8 | Mark `action_token:used:{jti}` (TTL = remaining token lifetime + 1 min margin) + increment the velocity counter | best-effort |
 | 9 | `ZINCRBY leaderboard:global delta user_id` | — |
 | 10 | If top-10 changed → publish to Pub/Sub | — |
 
-**Why the ledger writes before the Redis marker (ordering is load-bearing):** the durable store must be the authority on "was this token used", and the cache only a fast path. If the order were reversed (mark in Redis, then insert), a crash between the two would burn the token with no ledger record — the user's points would be unrecoverable and a retry would see `409`. With DB-first, every crash window is safe: crash after step 7 → the ledger has the event, a client retry hits the `UNIQUE` violation and receives the original response (natural idempotency); Redis staleness (marker or ZSET) is repaired by the reconciliation job (§8). The ledger is never wrong.
+**Why the ledger writes before the Redis marker (ordering is load-bearing):** the durable store must be the authority on "was this token used", and the cache only a fast path. If the order were reversed (mark in Redis, then insert), a crash between the two would burn the token with no ledger record — the user's points would be unrecoverable and a retry would see `409`. With DB-first, every crash window is safe: crash after step 7 → the ledger has the event, a client retry hits the `UNIQUE` violation and receives the recorded outcome (natural idempotency); Redis staleness (marker or ZSET) is repaired by the reconciliation job (§8). The ledger is never wrong.
 
-**One client-visible contract, whichever layer catches it:** both barriers respond to a repeat redemption the same way — the original response, replayed. The pre-filter is an optimization and must not change observable semantics; if step 5 returned a bare `409` while step 7 replayed the original response, the *common* retry path (response lost in transit, marker already set) would break the idempotency promise that the *rare* path (crash window) keeps. For the same reason the replay check runs *before* the velocity cap: a retry is not new activity, so it must neither consume quota nor be rejected by it. Replaying the response to the same user is safe: step 4 guarantees no other principal can redeem this token at all.
+**One client-visible contract, whichever layer catches it — and what it covers:** a repeat redemption returns the **recorded outcome**: `delta` and `newScore = score_after`, read from the ledger (this is why `score_events` stores `score_after` — without it the ledger could only reconstruct `userId + delta`, and the promise would be unimplementable). `rank` is deliberately **excluded** from the guarantee: it is a point-in-time view of a moving board, recomputed live on every response — freezing it would be meaningless, and pretending to replay it would be a lie. The pre-filter is an optimization and must not change observable semantics; if step 5 returned a bare `409` while step 7 replayed the recorded outcome, the *common* retry path (response lost in transit, marker already set) would break the idempotency promise that the *rare* path (crash window) keeps. For the same reason the replay check runs *before* the velocity cap: a retry is not new activity, so it must neither consume quota nor be rejected by it. Replaying the outcome to the same user is safe: step 4 guarantees no other principal can redeem this token at all.
 
 ### 5.3 `GET /api/v1/scoreboard` *(public, no auth)*
 
@@ -198,12 +210,12 @@ sequenceDiagram
     S->>R: EXISTS action_token:used:{jti} (fast pre-filter)
     alt marker present (already redeemed)
         S->>P: look up event by jti
-        S-->>U: idempotent replay of the original response
+        S-->>U: idempotent replay of the recorded outcome
     else not seen
         S->>S: velocity cap (429 if exceeded — token not consumed)
-        S->>P: INSERT score_events (UNIQUE jti = authoritative barrier)
+        S->>P: txn: UPDATE user_scores (row lock) + INSERT score_events (UNIQUE jti)
         alt UNIQUE violation (replay past the pre-filter)
-            S-->>U: idempotent response from the recorded event
+            S-->>U: idempotent replay of the recorded outcome
         else inserted
             S->>R: SET action_token:used:{jti} (marker) + ZINCRBY
             S->>R: PUBLISH scoreboard.updated (if top-10 changed)
@@ -224,7 +236,7 @@ Client          Action Svc        Score Svc          Redis        Postgres      
   |  (user completes action)          |                 |              |             |
   |--redeem token + user JWT--------->|                 |              |             |
   |                |                  |--EXISTS used?-->| (pre-filter) |             |
-  |                |                  |--INSERT event (UNIQUE jti)---->| (authority) |
+  |                |                  |--txn: total + event (UNIQUE)-->| (authority) |
   |                |                  |--SET+ZINCRBY--->|              |             |
   |                |                  |--PUBLISH------->|---top-10 changed---------->|
   |<--200 {newScore, rank}------------|                 |              |             |
@@ -236,7 +248,7 @@ Client          Action Svc        Score Svc          Redis        Postgres      
 | Attack | Defense |
 |---|---|
 | Forged/handcrafted API call with arbitrary points | No points field exists; deltas come from `action_score_rules` server-side |
-| Replaying a captured legitimate request | Single-use `jti`: DB `UNIQUE(action_token_id)` is the authoritative barrier, with a Redis marker as fast pre-filter. A replay never scores twice — the same user gets the original response replayed (idempotency), any other principal fails the `sub` check first |
+| Replaying a captured legitimate request | Single-use `jti`: DB `UNIQUE(action_token_id)` is the authoritative barrier, with a Redis marker as fast pre-filter. A replay never scores twice — the same user gets the recorded outcome replayed (idempotency), any other principal fails the `sub` check first |
 | Redeeming a token issued to another user | Step 4: token `sub` must equal JWT `sub` |
 | Minting tokens client-side | Tokens are signed with a key that never leaves the server (issuing endpoint is internal-only, mTLS) |
 | Completing actions inhumanly fast (botting) | Per-user rate limit + per-action-type velocity caps; breaches are flagged, not just rejected |
@@ -245,7 +257,7 @@ Client          Action Svc        Score Svc          Redis        Postgres      
 
 ## 8. Operations
 
-- **Reconciliation job** (every 5 min): recompute `SUM(delta)` per user for the last hour from Postgres, compare with ZSET, repair drift, alert if drift > 0.
+- **Reconciliation job** (every 5 min): compare the ZSET against `user_scores`, repair drift, alert if drift > 0. The ledger is self-auditing: for every user, `SUM(delta)` must equal the latest `score_after` must equal `user_scores.score` — three records of the same fact that cannot silently diverge.
 - **Cold start / Redis loss**: rebuild the entire ZSET from the ledger in one query; scoreboard degrades to §5.3 polling in the meantime, nothing is lost.
 - **Metrics**: redemption rate, idempotent-replay rate per user (replays return `200`, so probing shows up here, not in 4xx — a per-user spike = replay probing or a broken client retry loop), WS connection count, pub/sub fan-out latency (target: action completion → client repaint p95 < 500 ms).
 - **Scaling**: Score Service and WS gateways are stateless → horizontal scale behind the LB; Redis Pub/Sub decouples them. Single Redis handles ~100k `ZINCRBY`/s — sharding is a non-problem until far beyond this product's scale.
@@ -254,7 +266,7 @@ Client          Action Svc        Score Svc          Redis        Postgres      
 
 *(requested by the task — recommendations to the team beyond the stated requirements)*
 
-1. **Idempotency is built in — document it as a client contract.** The `jti` acts as the idempotency key: a retry after a network timeout receives the original response, not an error, *whichever barrier catches it* (§5.2 steps 5 and 7 deliberately converge on the same behavior). Spell this out in the client-facing API docs so mobile teams retry with confidence instead of inventing their own dedupe.
+1. **Idempotency is built in — document it as a client contract.** The `jti` acts as the idempotency key: a retry after a network timeout receives the recorded outcome (`delta`, `newScore`), not an error, *whichever barrier catches it* (§5.2 steps 5 and 7 deliberately converge on the same behavior; `rank` is live and excluded). Spell this out in the client-facing API docs so mobile teams retry with confidence instead of inventing their own dedupe.
 2. **Don't build diff-based WS frames.** Teams instinctively optimize this; at 10 rows the snapshot *is* the optimization. Revisit only if the board grows to hundreds of visible rows.
 3. **Season/period support will be asked for.** Keying the ZSET as `leaderboard:{period}` (e.g. `2026-W28`) from day one costs nothing and makes "weekly leaderboard" a config change instead of a migration.
 4. **Display names on the board**: resolve via a small cached user-profile lookup in the WS gateway, not stored in the ZSET — avoids rename-propagation bugs.
@@ -265,7 +277,7 @@ Client          Action Svc        Score Svc          Redis        Postgres      
 ## 10. Definition of done (for the implementing team)
 
 - [ ] All §5 endpoints implemented with the exact error codes in the validation table
-- [ ] Both replay layers in place (Redis pre-filter + DB `UNIQUE` authority) with a test proving a token can never score twice even when Redis is flushed mid-test — the retry must receive the idempotent replay of the original response, not a second score and not an error
+- [ ] Both replay layers in place (Redis pre-filter + DB `UNIQUE` authority) with a test proving a token can never score twice even when Redis is flushed mid-test — the retry must receive the idempotent replay of the recorded outcome, not a second score and not an error
 - [ ] Load test: 1k redemptions/s sustained, WS repaint p95 < 500 ms
 - [ ] Reconciliation job + drift alert wired to on-call
 - [ ] Runbook: Redis loss recovery drill executed once
