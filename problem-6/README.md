@@ -155,9 +155,11 @@ Validation pipeline (order matters — cheapest and most-likely-to-fail first):
 | 7 | One transaction: `UPDATE user_scores SET score = score + delta RETURNING score` (row lock serializes concurrent redemptions per user, yields `score_after`) + insert `score_events` — the `UNIQUE(action_token_id)` constraint is the **authoritative** single-use barrier | `UNIQUE` violation → idempotent: look up the recorded event by `jti`, return the recorded outcome |
 | 8 | Mark `action_token:used:{jti}` (TTL = remaining token lifetime + 1 min margin) + increment the velocity counter | best-effort |
 | 9 | `ZINCRBY leaderboard:global delta user_id` | — |
-| 10 | If top-10 changed → publish to Pub/Sub | — |
+| 10 | If top-10 changed — detected as `ZREVRANK leaderboard:global {user_id}` ≤ 9 right after the `ZINCRBY` — publish a poke to Pub/Sub | — |
 
 **Why the ledger writes before the Redis marker (ordering is load-bearing):** the durable store must be the authority on "was this token used", and the cache only a fast path. If the order were reversed (mark in Redis, then insert), a crash between the two would burn the token with no ledger record — the user's points would be unrecoverable and a retry would see `409`. With DB-first, every crash window is safe: crash after step 7 → the ledger has the event, a client retry hits the `UNIQUE` violation and receives the recorded outcome (natural idempotency); Redis staleness (marker or ZSET) is repaired by the reconciliation job (§8). The ledger is never wrong.
+
+**How "top-10 changed" is detected (step 10):** one `ZREVRANK` call on the user just updated, publish if ≤ 9. This is *sufficient*, not just cheap: scores are monotonic and each event moves exactly one member, so the visible board can only change when that member now sits inside it — entering it, reordering within it, or updating their displayed score. A user who gains points but stays outside the top 10 cannot alter any of the ten displayed rows. The published message is a *poke*, not data: gateways re-read the board and push-if-changed (§5.4), so a spurious publish costs one no-op read, and a missed one is healed by the heartbeat backstop.
 
 **One client-visible contract, whichever layer catches it — and what it covers:** a repeat redemption returns the **recorded outcome**: `delta` and `newScore = score_after`, read from the ledger (this is why `score_events` stores `score_after` — without it the ledger could only reconstruct `userId + delta`, and the promise would be unimplementable). `rank` is deliberately **excluded** from the guarantee: it is a point-in-time view of a moving board, recomputed live on every response — freezing it would be meaningless, and pretending to replay it would be a lie. The pre-filter is an optimization and must not change observable semantics; if step 5 returned a bare `409` while step 7 replayed the recorded outcome, the *common* retry path (response lost in transit, marker already set) would break the idempotency promise that the *rare* path (crash window) keeps. For the same reason the replay check runs *before* the velocity cap: a retry is not new activity, so it must neither consume quota nor be rejected by it. Replaying the outcome to the same user is safe: step 4 guarantees no other principal can redeem this token at all.
 
@@ -219,7 +221,7 @@ sequenceDiagram
             S-->>U: idempotent replay of the recorded outcome
         else inserted
             S->>R: SET action_token:used:{jti} (marker) + ZINCRBY
-            S->>R: PUBLISH scoreboard.updated (if top-10 changed)
+            S->>R: PUBLISH scoreboard.updated (if ZREVRANK user ≤ 9)
             S-->>U: 200 { newScore, rank }
             R-->>W: pub/sub message
             W-->>U: WS push: fresh top-10 snapshot
