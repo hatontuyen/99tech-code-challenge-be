@@ -180,7 +180,8 @@ Serves the initial page render (and the fallback for clients without WebSocket).
 
 - On connect: server immediately sends a `snapshot` frame (same shape as 5.3).
 - On change: server pushes a full top-10 `snapshot` frame — **not diffs**. The payload is ~10 rows; diff bookkeeping isn't worth the client-side complexity or the risk of missed-frame drift.
-- Heartbeat ping every 30s; clients reconnect with exponential backoff and get a fresh snapshot on reconnect, so no event replay is needed.
+- Heartbeat every 30s doubles as a **staleness backstop**: on each tick the gateway re-reads the top-10 from Redis and pushes it if it differs from the last frame it sent. Redis Pub/Sub is at-most-once (no buffer, no replay) — a gateway that misses a message would otherwise leave its *connected* clients stale until the next score change, indefinitely on a quiet board. With the backstop, pub/sub is the low-latency path and the heartbeat re-read is the correctness path; worst-case staleness is one heartbeat interval.
+- Clients reconnect with exponential backoff and get a fresh snapshot on connect, so no event replay is needed on either side.
 
 ```jsonc
 { "type": "snapshot", "asOf": "...", "data": [ /* top 10 */ ] }
@@ -280,4 +281,5 @@ Client          Action Svc        Score Svc          Redis        Postgres      
 - [ ] Both replay layers in place (Redis pre-filter + DB `UNIQUE` authority) with a test proving a token can never score twice even when Redis is flushed mid-test — the retry must receive the idempotent replay of the recorded outcome, not a second score and not an error
 - [ ] Load test: 1k redemptions/s sustained, WS repaint p95 < 500 ms
 - [ ] Reconciliation job + drift alert wired to on-call
+- [ ] Chaos test: drop a pub/sub delivery at one gateway — its connected clients must converge within one heartbeat interval via the snapshot backstop
 - [ ] Runbook: Redis loss recovery drill executed once
