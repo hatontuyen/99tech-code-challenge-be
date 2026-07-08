@@ -104,7 +104,7 @@ CREATE TABLE action_score_rules (
 );
 ```
 
-**Corrections are compensating events on a separate, admin-only path.** The redemption endpoint (§5.2) only ever inserts positive, token-backed events — its deltas come from `action_score_rules`, which enforces `delta > 0`. Corrections (fraud rollback, support adjustments) are negative compensating events inserted by an internal admin endpoint (mTLS + admin authz; out of implementation scope for v1 — the schema above already supports it, so adding it later is no migration). That path must reuse the §5.2 step-7 transaction shape (`UPDATE user_scores … RETURNING` + insert with `score_after`), apply the negative `ZINCRBY`, and then **publish + bump the board version (§9.6) unconditionally**: the step-10 `ZREVRANK` shortcut is valid only for increases — when a top-10 member's score *drops*, the user pulled onto the board is someone else, whom no check on the corrected user would detect.
+**Corrections are compensating events on a separate, admin-only path.** The redemption endpoint (§5.2) only ever inserts positive, token-backed events — its deltas come from `action_score_rules`, which enforces `delta > 0`. Corrections (fraud rollback, support adjustments) are negative compensating events inserted by an internal admin endpoint (mTLS + admin authz; out of implementation scope for v1 — the schema above already supports it, so adding it later is no migration). That path must reuse the §5.2 step-7 transaction shape, except the total-update is a plain `UPDATE … RETURNING` that errors when no `user_scores` row exists (correcting a user who has never scored is a caller mistake, not a row to create) + insert with `score_after`, then apply the negative `ZINCRBY`, and **publish unconditionally** (bumping the board version too, if §9.6 is adopted): the step-10 `ZREVRANK` shortcut is valid only for increases — when a top-10 member's score *drops*, the user pulled onto the board is someone else, whom no check on the corrected user would detect.
 
 Redis keys:
 
@@ -184,7 +184,7 @@ Validation pipeline (order matters — cheapest and most-likely-to-fail first):
 }
 ```
 
-Serves the initial page render (and the fallback for clients without WebSocket). Backed directly by `ZREVRANGE`; may additionally be micro-cached for 1s at the gateway under heavy load.
+Serves the initial page render (and the fallback for clients without WebSocket). Backed directly by `ZREVRANGE`; `displayName` is resolved through the same cached user-profile lookup the WS gateways use (§9.4). May additionally be micro-cached for 1s at the gateway under heavy load.
 
 ### 5.4 `WS /api/v1/scoreboard/live` — live updates
 
@@ -224,7 +224,7 @@ sequenceDiagram
         S-->>U: idempotent replay of the recorded outcome
     else not seen
         S->>S: velocity cap (429 if exceeded — token not consumed)
-        S->>P: txn: UPDATE user_scores (row lock) + INSERT score_events (UNIQUE jti)
+        S->>P: txn: UPSERT user_scores (row lock) + INSERT score_events (UNIQUE jti)
         alt UNIQUE violation (replay past the pre-filter)
             S-->>U: idempotent replay of the recorded outcome
         else inserted
@@ -268,7 +268,7 @@ Client          Action Svc        Score Svc          Redis        Postgres      
 
 ## 8. Operations
 
-- **Reconciliation job** (every 5 min): compare the ZSET against `user_scores`, repair drift, alert if drift > 0. The ledger is self-auditing: for every user, `SUM(delta)` must equal the latest `score_after` must equal `user_scores.score` — three records of the same fact that cannot silently diverge.
+- **Reconciliation job** (every 5 min): compare the ZSET against `user_scores`; **both repair and alert act only on the second consecutive observation** of the same user's drift (the job keeps the previous run's drift set). A one-off mismatch is usually an event still in flight between the DB commit (step 7) and its `ZINCRBY` (step 9) — repairing it immediately would *cause* a double count (the repair writes the DB total, then the in-flight `ZINCRBY` adds the delta on top), and it would also erase the very signal a persistence-based alert needs. In-flight drift self-heals before the next run; drift that survives two runs is real → repair and alert together. The ledger is self-auditing: for every user, `SUM(delta)` must equal the latest `score_after` must equal `user_scores.score` — three records of the same fact that cannot silently diverge.
 - **Cold start / Redis loss**: rebuild the entire ZSET straight from `user_scores` in one query (the ledger stays the deeper audit source); scoreboard degrades to §5.3 polling in the meantime, nothing is lost.
 - **Metrics**: redemption rate, idempotent-replay rate per user (replays return `200`, so probing shows up here, not in 4xx — a per-user spike = replay probing or a broken client retry loop), WS connection count, pub/sub fan-out latency (target: action completion → client repaint p95 < 500 ms).
 - **Scaling**: Score Service and WS gateways are stateless → horizontal scale behind the LB; Redis Pub/Sub decouples them. Single Redis handles ~100k `ZINCRBY`/s — sharding is a non-problem until far beyond this product's scale.
@@ -280,7 +280,7 @@ Client          Action Svc        Score Svc          Redis        Postgres      
 1. **Idempotency is built in — document it as a client contract.** The `jti` acts as the idempotency key: a retry after a network timeout receives the recorded outcome (`delta`, `newScore`), not an error, *whichever barrier catches it* (§5.2 steps 5 and 7 deliberately converge on the same behavior; `rank` is live and excluded). Spell this out in the client-facing API docs so mobile teams retry with confidence instead of inventing their own dedupe.
 2. **Don't build diff-based WS frames.** Teams instinctively optimize this; at 10 rows the snapshot *is* the optimization. Revisit only if the board grows to hundreds of visible rows.
 3. **Season/period support will be asked for.** Keying the ZSET as `leaderboard:{period}` (e.g. `2026-W28`) from day one costs nothing and makes "weekly leaderboard" a config change instead of a migration.
-4. **Display names on the board**: resolve via a small cached user-profile lookup in the WS gateway, not stored in the ZSET — avoids rename-propagation bugs.
+4. **Display names on the board**: resolve via a small cached user-profile lookup at read time (WS gateways and the §5.3 endpoint), not stored in the ZSET — avoids rename-propagation bugs.
 5. **Anomaly review queue, not auto-bans.** Velocity breaches can't be flagged on the ledger — a rejected redemption inserts no `score_events` row — so record them in a separate `velocity_breaches` table (or structured log feeding an alert): `user_id`, `action_type`, window, count. Human review from there; auto-punishing false positives on a public leaderboard is a support nightmare.
 6. **Frame ordering: a monotonic version number, not signatures and not timestamps.** `INCR scoreboard:version` whenever the board may have changed — the step-10 condition on the redemption path, unconditionally on the correction path (§4); every frame carries it, clients drop frames older than the last seen. A spurious bump costs one no-op re-read; a missed one would cost correctness, so the bias is deliberate. It must be this and not the alternatives: a gateway-local sequence breaks the moment a client reconnects to a different gateway; `asOf` timestamps skew across hosts; signing solves integrity, which WSS already provides — the only real problem here is ordering. Bonus: the heartbeat backstop's push-if-changed becomes a one-integer comparison instead of a frame diff. One rule when building a frame: read the version and the board atomically (`MULTI`/`EXEC` or a small Lua script) — two separate reads under concurrent updates can pair a newer board with an older version, producing a frame clients wrongly drop.
 7. **Open question for the action team:** can one user legitimately run several actions concurrently? If yes, keep the 10-minute token TTL; if strictly sequential, drop it to ~2× median action duration to shrink the replay window further.
