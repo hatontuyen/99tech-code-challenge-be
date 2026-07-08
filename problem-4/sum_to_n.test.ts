@@ -45,9 +45,26 @@ for (let i = 0; i < 500; i++) {
   }
 }
 
+// Safe-integer boundary: the largest n whose sum is still a safe integer.
+// Exercises the closed form's exactness argument (the intermediate n*(n+1)
+// is ~2^54 here — exact only because it is even). The O(n) implementations
+// are deliberately skipped at this size to keep the suite instant.
+const N_MAX = 134_217_727;
+const SUM_MAX = 9_007_199_187_632_128;
+for (const [n, expected] of [
+  [N_MAX, SUM_MAX],
+  [-N_MAX, -SUM_MAX],
+] as const) {
+  const actual = sum_to_n_a(n);
+  if (actual !== expected || !Number.isSafeInteger(actual)) {
+    failures++;
+    console.error(`FAIL sum_to_n_a(${n}) = ${actual}, expected ${expected} (safe integer)`);
+  }
+}
+
 if (failures === 0) {
   console.log(
-    `PASS all ${cases.length} fixed cases + 500 randomized property checks (x3 implementations)`,
+    `PASS all ${cases.length} fixed cases + 500 randomized property checks (x3 implementations) + safe-integer boundary`,
   );
 } else {
   console.error(`${failures} failure(s)`);

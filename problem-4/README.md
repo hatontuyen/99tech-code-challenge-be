@@ -9,7 +9,7 @@
 
 | | Approach | Time | Space | Notes |
 |---|---|---|---|---|
-| `sum_to_n_a` | Gauss closed-form `n(n+1)/2` | **O(1)** | O(1) | The production choice. Intermediate `n(n+1)` is exactly 2× the result, so it stays within safe-integer range whenever the result does. |
+| `sum_to_n_a` | Gauss closed-form `n(n+1)/2` | **O(1)** | O(1) | The production choice. Intermediate `n(n+1)` reaches ~2⁵⁴ (outside the safe range) at the largest valid `n`, yet stays exact: above 2⁵³ doubles represent exactly the even integers, and a product of consecutive integers is always even. Pinned at the boundary in the tests. |
 | `sum_to_n_b` | Iterative loop | O(n) | O(1) | Trivially correct by inspection → used as the oracle to validate the other two. |
 | `sum_to_n_c` | Divide-and-conquer recursion | O(n) additions | **O(log n) stack** | Naive `n + f(n-1)` recursion blows the call stack at n ≈ 10⁴; halving the range keeps depth logarithmic, so it works for any valid input. |
 
@@ -28,5 +28,5 @@ The spec doesn't define behavior for `n <= 0` while stating the input is *any* i
 
 ```bash
 npx tsx sum_to_n.test.ts
-# PASS all 9 fixed cases + 500 randomized property checks (x3 implementations)
+# PASS all 9 fixed cases + 500 randomized property checks (x3 implementations) + safe-integer boundary
 ```

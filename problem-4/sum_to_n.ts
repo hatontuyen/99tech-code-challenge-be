@@ -16,9 +16,12 @@
  * Complexity: O(1) time, O(1) space.
  *
  * The production choice — constant time regardless of n. The intermediate
- * product m * (m + 1) is exactly 2x the final result, so as long as the
- * result fits in Number.MAX_SAFE_INTEGER (guaranteed by the task), the
- * intermediate stays inside the 2^53 exact-integer range too.
+ * product m * (m + 1) stays exact, but not because it fits in 2^53 — at the
+ * largest safe n it is ~2^54. Above 2^53 doubles represent only *even*
+ * integers exactly, and a product of two consecutive integers is always
+ * even, so the intermediate (2x the result, result <= MAX_SAFE_INTEGER per
+ * the task) is exactly representable. The test file pins this at the exact
+ * boundary (n = 134,217,727).
  */
 function sum_to_n_a(n: number): number {
   const sign = n < 0 ? -1 : 1;
