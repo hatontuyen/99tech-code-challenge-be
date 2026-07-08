@@ -91,6 +91,14 @@ async function main() {
   assert.equal(inactive.json.data[0].symbol, 'ZIL');
   const search = await call('GET', '/api/v1/tokens?search=switch');
   assert.equal(search.json.data[0].symbol, 'SWTH');
+  // LIKE wildcard escaping: searching "50%" means the literal string (README claim).
+  await call('POST', '/api/v1/tokens', { symbol: 'PCT', name: 'Token 50% Bonus', chain: 'Neo' });
+  const literal = await call('GET', `/api/v1/tokens?search=${encodeURIComponent('50%')}`);
+  assert.equal(literal.json.data.length, 1, 'search "50%" finds the literal match');
+  // If % were still a wildcard, "5X%" would match "5X<anything>" — must be empty.
+  const wildcard = await call('GET', `/api/v1/tokens?search=${encodeURIComponent('5X%')}`);
+  assert.equal(wildcard.json.data.length, 0, 'escaped % must not act as a wildcard');
+  await call('DELETE', `/api/v1/tokens/${literal.json.data[0].id}`);
   const sorted = await call('GET', '/api/v1/tokens?sort=symbol&order=asc&limit=2&page=1');
   assert.deepEqual(
     sorted.json.data.map((t: { symbol: string }) => t.symbol),
