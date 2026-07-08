@@ -24,7 +24,7 @@ The website shows a scoreboard with the **top 10 users by score**, updated **liv
 ### Assumptions (declared per the challenge instructions)
 
 - An Auth Service issuing user JWTs already exists (implied by "prevent unauthorized").
-- Scores only increase (requirement 3); corrections are compensating events, not mutations.
+- Scores only increase through user actions (requirement 3); corrections are negative compensating events on an admin-only path (§4), never mutations.
 - One global leaderboard for now — §9.3 keys the design so per-period boards are a config change.
 - The action has a server-known start (needed to issue the action token); §9.7 raises the open question if that doesn't hold.
 
@@ -65,30 +65,34 @@ flowchart LR
 | Live channel | Fan-out of top-10 changes | WebSocket gateway(s) subscribed to Redis Pub/Sub |
 | Auth Service | Issues the user JWTs we verify | existing |
 
-**Why both Redis and Postgres:** Redis answers "top 10" in sub-millisecond time but is a cache, not a ledger. Every accepted event is written to `score_events` first (append-only); the Redis ZSET can be rebuilt from Postgres at any time (`SUM(delta) GROUP BY user_id`). If Redis and Postgres disagree, Postgres wins.
+**Why both Redis and Postgres:** Redis answers "top 10" in sub-millisecond time but is a cache, not a ledger. Every accepted event is written to Postgres first; the Redis ZSET can be rebuilt at any time from `user_scores` (or re-derived from the `score_events` ledger). If Redis and Postgres disagree, Postgres wins.
 
 ## 4. Data model
 
 ```sql
--- Materialized per-user total, owned by this module. Updated in the same
--- transaction as the ledger insert; its row lock serializes concurrent
--- redemptions for one user and yields score_after atomically.
+-- Materialized per-user total, owned by this module. Upserted in the same
+-- transaction as the ledger insert (the row is created on a user's first
+-- redemption); its row lock serializes concurrent redemptions for one user
+-- and yields score_after atomically.
 CREATE TABLE user_scores (
   user_id UUID PRIMARY KEY REFERENCES users(id),
   score   BIGINT NOT NULL DEFAULT 0
 );
 
--- Append-only ledger. Never UPDATE; corrections are compensating events.
+-- Append-only ledger. Never UPDATE; corrections are compensating events (see below).
 CREATE TABLE score_events (
   id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   user_id       UUID        NOT NULL REFERENCES users(id),
-  action_type   TEXT        NOT NULL,          -- e.g. 'daily_quest'
-  delta         INTEGER     NOT NULL CHECK (delta > 0),
+  action_type   TEXT        NOT NULL,          -- e.g. 'daily_quest', 'admin_correction'
+  delta         INTEGER     NOT NULL,          -- > 0: redemption; < 0: compensating correction
   score_after   BIGINT      NOT NULL,          -- running total after this event: makes the
                                                -- idempotent replay reconstructible (§5.2) and
                                                -- the ledger self-auditing (§8)
-  action_token_id UUID      NOT NULL UNIQUE,   -- DB-level replay protection
-  created_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+  action_token_id UUID      UNIQUE,            -- DB-level replay protection; NULL only for
+                                               -- corrections (Postgres UNIQUE ignores NULLs)
+  created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+  -- exactly two event shapes: redemption (positive, token-backed) or correction (negative, admin)
+  CHECK ((delta > 0 AND action_token_id IS NOT NULL) OR (delta < 0 AND action_token_id IS NULL))
 );
 CREATE INDEX idx_score_events_user ON score_events (user_id, created_at);
 
@@ -99,6 +103,8 @@ CREATE TABLE action_score_rules (
   max_per_user_per_hour INTEGER NOT NULL      -- velocity cap
 );
 ```
+
+**Corrections are compensating events on a separate, admin-only path.** The redemption endpoint (§5.2) only ever inserts positive, token-backed events — its deltas come from `action_score_rules`, which enforces `delta > 0`. Corrections (fraud rollback, support adjustments) are negative compensating events inserted by an internal admin endpoint (mTLS + admin authz; out of implementation scope for v1 — the schema above already supports it, so adding it later is no migration). That path must reuse the §5.2 step-7 transaction shape (`UPDATE user_scores … RETURNING` + insert with `score_after`), apply the negative `ZINCRBY`, and then **publish + bump the board version (§9.6) unconditionally**: the step-10 `ZREVRANK` shortcut is valid only for increases — when a top-10 member's score *drops*, the user pulled onto the board is someone else, whom no check on the corrected user would detect.
 
 Redis keys:
 
@@ -152,7 +158,7 @@ Validation pipeline (order matters — cheapest and most-likely-to-fail first):
 | 4 | `token.sub === jwt.sub` (no redeeming someone else's token) | `403 TOKEN_USER_MISMATCH` |
 | 5 | Fast replay pre-filter: `EXISTS action_token:used:{jti}` — an already-redeemed token short-circuits here, **before** the velocity check, so retries never consume quota or hit the cap | marker hit → **same idempotent path as step 7**: look up the event by `jti`, return the recorded outcome; `409 TOKEN_ALREADY_USED` only if no ledger record exists (anomaly — impossible under DB-first ordering) |
 | 6 | Velocity: per-user per-action-type hourly cap — checked **before** the token is consumed, so an over-cap user's token is not burned. The counter increments only on accept (step 8), so rejected and replayed requests don't eat quota | `429 VELOCITY_EXCEEDED` (flag for review) |
-| 7 | One transaction: `UPDATE user_scores SET score = score + delta RETURNING score` (row lock serializes concurrent redemptions per user, yields `score_after`) + insert `score_events` — the `UNIQUE(action_token_id)` constraint is the **authoritative** single-use barrier | `UNIQUE` violation → idempotent: look up the recorded event by `jti`, return the recorded outcome |
+| 7 | One transaction: `INSERT INTO user_scores (user_id, score) VALUES ($user, $delta) ON CONFLICT (user_id) DO UPDATE SET score = user_scores.score + EXCLUDED.score RETURNING score` (upsert, so a user's first-ever redemption creates the row; the row lock serializes concurrent redemptions per user and yields `score_after`) + insert `score_events` — the `UNIQUE(action_token_id)` constraint is the **authoritative** single-use barrier | `UNIQUE` violation → idempotent: look up the recorded event by `jti`, return the recorded outcome |
 | 8 | Mark `action_token:used:{jti}` (TTL = remaining token lifetime + 1 min margin) + increment the velocity counter | best-effort |
 | 9 | `ZINCRBY leaderboard:global delta user_id` | — |
 | 10 | If top-10 changed — detected as `ZREVRANK leaderboard:global {user_id}` ≤ 9 right after the `ZINCRBY` — publish a poke to Pub/Sub | — |
@@ -161,7 +167,7 @@ Validation pipeline (order matters — cheapest and most-likely-to-fail first):
 
 **The velocity cap is a tripwire, not an invariant:** the check (step 6) and the increment (step 8) are deliberately split, so concurrent redemptions from one user can all pass the check and overshoot the cap by the number of in-flight requests. This is accepted, not overlooked: the cap exists to flag anomalies for human review (§9.5), while replay-proofing — the actual security boundary — lives entirely in the token barriers, which no race weakens. If a hard cap is ever required, count the user's ledger events for the window inside the step-7 transaction (already serialized per user by the `user_scores` row lock) at the cost of one indexed `COUNT` per redemption.
 
-**How "top-10 changed" is detected (step 10):** one `ZREVRANK` call on the user just updated, publish if ≤ 9. This is *sufficient*, not just cheap: scores are monotonic and each event moves exactly one member, so the visible board can only change when that member now sits inside it — entering it, reordering within it, or updating their displayed score. A user who gains points but stays outside the top 10 cannot alter any of the ten displayed rows. The published message is a *poke*, not data: gateways re-read the board and push-if-changed (§5.4), so a spurious publish costs one no-op read, and a missed one is healed by the heartbeat backstop.
+**How "top-10 changed" is detected (step 10):** one `ZREVRANK` call on the user just updated, publish if ≤ 9. This is *sufficient*, not just cheap: scores are monotonic and each event moves exactly one member, so the visible board can only change when that member now sits inside it — entering it, reordering within it, or updating their displayed score. A user who gains points but stays outside the top 10 cannot alter any of the ten displayed rows. (This argument holds only because redemption deltas are strictly positive — the admin correction path publishes unconditionally, §4.) The published message is a *poke*, not data: gateways re-read the board and push-if-changed (§5.4), so a spurious publish costs one no-op read, and a missed one is healed by the heartbeat backstop.
 
 **One client-visible contract, whichever layer catches it — and what it covers:** a repeat redemption returns the **recorded outcome**: `delta` and `newScore = score_after`, read from the ledger (this is why `score_events` stores `score_after` — without it the ledger could only reconstruct `userId + delta`, and the promise would be unimplementable). `rank` is deliberately **excluded** from the guarantee: it is a point-in-time view of a moving board, recomputed live on every response — freezing it would be meaningless, and pretending to replay it would be a lie. The pre-filter is an optimization and must not change observable semantics; if step 5 returned a bare `409` while step 7 replayed the recorded outcome, the *common* retry path (response lost in transit, marker already set) would break the idempotency promise that the *rare* path (crash window) keeps. For the same reason the replay check runs *before* the velocity cap: a retry is not new activity, so it must neither consume quota nor be rejected by it. Replaying the outcome to the same user is safe: step 4 guarantees no other principal can redeem this token at all.
 
@@ -257,13 +263,13 @@ Client          Action Svc        Score Svc          Redis        Postgres      
 | Redeeming a token issued to another user | Step 4: token `sub` must equal JWT `sub` |
 | Minting tokens client-side | Tokens are signed with a key that never leaves the server (issuing endpoint is internal-only, mTLS) |
 | Completing actions inhumanly fast (botting) | Per-user rate limit + per-action-type velocity caps; breaches are flagged, not just rejected |
-| Stolen JWT | Standard JWT TTL/rotation (Auth Service); velocity caps bound damage; audit ledger enables exact rollback via compensating events |
+| Stolen JWT | Standard JWT TTL/rotation (Auth Service); velocity caps bound damage; audit ledger enables exact rollback via compensating events (§4 admin path) |
 | Score tampering in storage | Redis is a rebuildable cache; Postgres ledger is append-only and access-controlled |
 
 ## 8. Operations
 
 - **Reconciliation job** (every 5 min): compare the ZSET against `user_scores`, repair drift, alert if drift > 0. The ledger is self-auditing: for every user, `SUM(delta)` must equal the latest `score_after` must equal `user_scores.score` — three records of the same fact that cannot silently diverge.
-- **Cold start / Redis loss**: rebuild the entire ZSET from the ledger in one query; scoreboard degrades to §5.3 polling in the meantime, nothing is lost.
+- **Cold start / Redis loss**: rebuild the entire ZSET straight from `user_scores` in one query (the ledger stays the deeper audit source); scoreboard degrades to §5.3 polling in the meantime, nothing is lost.
 - **Metrics**: redemption rate, idempotent-replay rate per user (replays return `200`, so probing shows up here, not in 4xx — a per-user spike = replay probing or a broken client retry loop), WS connection count, pub/sub fan-out latency (target: action completion → client repaint p95 < 500 ms).
 - **Scaling**: Score Service and WS gateways are stateless → horizontal scale behind the LB; Redis Pub/Sub decouples them. Single Redis handles ~100k `ZINCRBY`/s — sharding is a non-problem until far beyond this product's scale.
 
@@ -275,8 +281,8 @@ Client          Action Svc        Score Svc          Redis        Postgres      
 2. **Don't build diff-based WS frames.** Teams instinctively optimize this; at 10 rows the snapshot *is* the optimization. Revisit only if the board grows to hundreds of visible rows.
 3. **Season/period support will be asked for.** Keying the ZSET as `leaderboard:{period}` (e.g. `2026-W28`) from day one costs nothing and makes "weekly leaderboard" a config change instead of a migration.
 4. **Display names on the board**: resolve via a small cached user-profile lookup in the WS gateway, not stored in the ZSET — avoids rename-propagation bugs.
-5. **Anomaly review queue, not auto-bans.** Velocity breaches should flag `score_events.flagged = true` for human review; auto-punishing false positives on a public leaderboard is a support nightmare.
-6. **Frame ordering: a monotonic version number, not signatures and not timestamps.** `INCR scoreboard:version` exactly when the step-10 condition fires (so the version increments iff the visible board changed); every frame carries it, clients drop frames older than the last seen. It must be this and not the alternatives: a gateway-local sequence breaks the moment a client reconnects to a different gateway; `asOf` timestamps skew across hosts; signing solves integrity, which WSS already provides — the only real problem here is ordering. Bonus: the heartbeat backstop's push-if-changed becomes a one-integer comparison instead of a frame diff.
+5. **Anomaly review queue, not auto-bans.** Velocity breaches can't be flagged on the ledger — a rejected redemption inserts no `score_events` row — so record them in a separate `velocity_breaches` table (or structured log feeding an alert): `user_id`, `action_type`, window, count. Human review from there; auto-punishing false positives on a public leaderboard is a support nightmare.
+6. **Frame ordering: a monotonic version number, not signatures and not timestamps.** `INCR scoreboard:version` whenever the board may have changed — the step-10 condition on the redemption path, unconditionally on the correction path (§4); every frame carries it, clients drop frames older than the last seen. A spurious bump costs one no-op re-read; a missed one would cost correctness, so the bias is deliberate. It must be this and not the alternatives: a gateway-local sequence breaks the moment a client reconnects to a different gateway; `asOf` timestamps skew across hosts; signing solves integrity, which WSS already provides — the only real problem here is ordering. Bonus: the heartbeat backstop's push-if-changed becomes a one-integer comparison instead of a frame diff. One rule when building a frame: read the version and the board atomically (`MULTI`/`EXEC` or a small Lua script) — two separate reads under concurrent updates can pair a newer board with an older version, producing a frame clients wrongly drop.
 7. **Open question for the action team:** can one user legitimately run several actions concurrently? If yes, keep the 10-minute token TTL; if strictly sequential, drop it to ~2× median action duration to shrink the replay window further.
 
 ## 10. Definition of done (for the implementing team)
